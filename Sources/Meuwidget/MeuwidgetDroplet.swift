@@ -363,6 +363,13 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
     /// another app is activated. The harness cannot show it, and the Playground
     /// needs a bundle `droppykit build` cannot produce with Swift 6.3.3. If
     /// Droppy closes the surface on activation, the refusal is only logged.
+    ///
+    /// Also not yet confirmed: whether activating the target app takes keyboard
+    /// focus away from the search field. After a refusal the surface asks for
+    /// the field's focus back, defensively. That can only reach the field if
+    /// the surface's window is key again, and DroppyKit 1.2.0 gives a droplet no
+    /// way to make it so; if Droppy leaves it unfocused, the user clicks the
+    /// field to keep going.
     func confirm(_ row: PaletteRow) {
         selectedPath = row.path
         guard executionTask == nil else { return }
@@ -686,6 +693,12 @@ private struct CommandsSurface: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .onAppear {
             if !context.isPreview { isSearchFocused = true }
+        }
+        .onChange(of: droplet.notice) { _, notice in
+            // Bringing the target app forward for the press may have taken
+            // focus from the field. After a refusal the palette is still in
+            // use, so ask for it back. See MeuwidgetDroplet.confirm(_:).
+            if notice == .disabledNow, !context.isPreview { isSearchFocused = true }
         }
     }
 
