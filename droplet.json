@@ -1,0 +1,34 @@
+{
+  "id": "meuwidget",
+  "name": "Meu Widget",
+  "version": "1.0.0",
+  "summary": "Run the menu commands of the app in use from a shortcut",
+  "description": "Press the shortcut and Meu Widget opens an expanded surface on the notch listing the menu commands of the app you are using. Choose one and it runs, as if you had picked it from that app's menu bar. The shelf widget is only an entry point and a status indicator; the feature itself lives in the expanded surface.\n\nWhy it asks for Accessibility: macOS exposes another app's menu bar only through the Accessibility API. Meu Widget uses it for exactly two things: reading the menu items of the frontmost app, and pressing the one item you choose.\n\nWhen it uses Accessibility: only after you press the shortcut. Each press reads the frontmost app's menu bar once, and a command is pressed only when you choose it. Meu Widget does not read anything continuously or in the background: it installs no Accessibility observers, runs no timers or polling, and reads nothing while the surface is closed.\n\nWhat it does not touch: window contents, document text, text fields, or anything outside the menu bar. It does not type, click or move the pointer in other apps. It declares no network capability.\n\nWhy it asks for Global shortcuts: to register the single shortcut that opens the surface. You can rebind it.",
+  "category": "Productivity",
+  "kit": {
+    "abi": 1,
+    "minAPI": "1.1.0"
+  },
+  "minAppVersion": "15.3.0",
+  "capabilities": [
+    "accessibility",
+    "global-shortcuts"
+  ],
+  "surfaces": [
+    "shelf-widget",
+    "expanded-surface"
+  ],
+  "icon": "Meuwidget.icon",
+  "creator": {
+    "name": "Your name",
+    "kind": "community",
+    "url": "https://example.com",
+    "avatar": "Creator.png"
+  },
+  "source": {
+    "repository": "https://github.com/you/meuwidget",
+    "commit": "",
+    "license": "MIT"
+  },
+  "keywords": []
+}
