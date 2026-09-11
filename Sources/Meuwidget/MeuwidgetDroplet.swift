@@ -35,13 +35,15 @@ enum PaletteStatus: Equatable {
     case failed
 }
 
-/// Why confirming a row did not run anything.
+/// Why confirming a row did not run anything, shown in the surface's footer.
 enum PaletteNotice: Equatable {
     /// The row has no live command yet, and the scan that will provide one is
     /// still running.
     case waitingForScan
     /// The row has no live command, and no scan is coming to provide one.
     case unavailable
+    /// The app reported the command disabled at the moment it was pressed.
+    case disabledNow
 }
 
 /// The latest scan's commands, with their live AX references.
@@ -344,13 +346,23 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
 
     /// Runs the command behind `row`, if there is a live one to press.
     ///
-    /// The row's enabled state is only what the scan saw, and an app that was
-    /// not active then can report most of its items disabled, so it decides
-    /// nothing here. The surface closes and the target app comes forward first;
-    /// then the executor reads the item's enabled state again from its live
-    /// reference and presses it only if the app reports it enabled at that
-    /// moment. A refused or failed press is logged; the surface is already
-    /// closed.
+    /// The surface stays open until the command has run. The target app comes
+    /// forward first, with the surface still up; then the executor reads the
+    /// item's enabled state again from its live reference and presses it only
+    /// if the app reports it enabled at that moment. The row's enabled state is
+    /// only what the scan saw, and an app that was not active then can report
+    /// most of its items disabled, so it decides nothing here.
+    ///
+    /// - It ran: the surface closes, leaving the target app in front.
+    /// - Refused as disabled, and the surface is still presented: the footer
+    ///   says so and the palette stays, so another item can be chosen.
+    /// - Refused as disabled, but the surface is gone: logged, nothing reopens.
+    /// - Any other failure: the surface closes and the failure is logged.
+    ///
+    /// Not yet confirmed in Droppy: that the surface stays visible while
+    /// another app is activated. The harness cannot show it, and the Playground
+    /// needs a bundle `droppykit build` cannot produce with Swift 6.3.3. If
+    /// Droppy closes the surface on activation, the refusal is only logged.
     func confirm(_ row: PaletteRow) {
         selectedPath = row.path
         guard executionTask == nil else { return }
@@ -359,13 +371,11 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
             notice = status == .scanning ? .waitingForScan : .unavailable
             return
         }
+        notice = nil
 
+        let confirmedPresentation = presentation
         let usageStore = usageStore
         let executor = executor
-
-        // Dismissing ends the session and drops the live references, which is
-        // why the command and the target are captured above.
-        host?.notchSurface.dismissExpandedSurface(Self.commandsSurfaceID)
 
         executionTask = Task { [weak self] in
             let isFrontmost = await Self.bringForward(target)
@@ -383,22 +393,42 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
             if !isFrontmost {
                 self.host?.log.notice("the target app did not come forward before the press")
             }
-            if let failure {
-                if failure == .disabled {
-                    self.host?.log.notice("the menu command was still disabled when it was pressed; nothing ran")
+
+            switch failure {
+            case nil:
+                self.dismissSurface(ifStill: confirmedPresentation)
+                if let bundleIdentifier = target.bundleIdentifier, let usageStore {
+                    do {
+                        try await usageStore.recordUse(of: command.path, bundleIdentifier: bundleIdentifier)
+                    } catch {
+                        self.host?.log.error("could not record command usage: \(error)")
+                    }
+                }
+            case .disabled?:
+                if self.isStillPresented(confirmedPresentation) {
+                    self.notice = .disabledNow
                 } else {
-                    self.host?.log.notice("pressing the menu command failed: \(failure)")
+                    self.host?.log.notice("the menu command was disabled when pressed and the surface had already closed; nothing ran")
                 }
-                return
-            }
-            if let bundleIdentifier = target.bundleIdentifier, let usageStore {
-                do {
-                    try await usageStore.recordUse(of: command.path, bundleIdentifier: bundleIdentifier)
-                } catch {
-                    self.host?.log.error("could not record command usage: \(error)")
-                }
+            case let failure?:
+                self.host?.log.notice("pressing the menu command failed: \(failure)")
+                self.dismissSurface(ifStill: confirmedPresentation)
             }
         }
+    }
+
+    /// Whether the presentation a row was confirmed from is still on screen,
+    /// by the host's account as well as ours.
+    private func isStillPresented(_ confirmedPresentation: ExpandedSurfacePresentation?) -> Bool {
+        guard let confirmedPresentation, presentation == confirmedPresentation else { return false }
+        return host?.notchSurface.expandedState.current?.id == confirmedPresentation.id
+    }
+
+    /// Closes the surface, unless the presentation a row was confirmed from has
+    /// already gone. Dismissal ends the session.
+    private func dismissSurface(ifStill confirmedPresentation: ExpandedSurfacePresentation?) {
+        guard isStillPresented(confirmedPresentation) else { return }
+        host?.notchSurface.dismissExpandedSurface(Self.commandsSurfaceID)
     }
 
     /// Asks for `target` to become the active app and waits, at most half a
@@ -422,13 +452,15 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
 
     // MARK: Cache
 
-    /// Deletes every menu cached on disk. A scan already running does not write
-    /// its result back; the palette that is open keeps showing what it has.
-    /// Command usage is kept.
+    /// Deletes everything the droplet keeps on disk, at once: every cached menu
+    /// and every app's command usage. A scan already running does not write its
+    /// menu back; a command already being run when this is called is still
+    /// counted. The palette that is open keeps showing what it has.
     public func clearMenuCache() async throws {
-        guard let diskCache else { return }
+        guard let diskCache, let usageStore else { return }
         try await diskCache.removeAll()
-        host?.log.info("menu cache cleared")
+        try await usageStore.removeAll()
+        host?.log.info("menu cache and command usage cleared")
     }
 
     @discardableResult
@@ -488,7 +520,7 @@ private struct MenuCacheSettingsPopover: View {
             DropletControlRow(
                 title: "Cache de menus",
                 icon: "internaldrive",
-                infoTip: "Títulos, atalhos de teclado e estado habilitado dos comandos de cada app, guardados só neste Mac."
+                infoTip: "Títulos, atalhos de teclado e estado habilitado dos comandos de cada app, e quantas vezes e quando cada um foi usado. Fica tudo só neste Mac, e limpar apaga tudo de uma vez."
             ) {
                 HStack(spacing: DroppySpacing.sm) {
                     if let statusText {
@@ -600,7 +632,7 @@ extension MeuwidgetDroplet: ExpandedSurfaceHosting {
 /// The commands surface: a search field over the app's menu commands.
 ///
 /// Up and down move the selection, Return runs it, and a click runs the row
-/// clicked.
+/// clicked. Why a confirmation did not run anything shows in the footer.
 private struct CommandsSurface: View {
     @ObservedObject var droplet: MeuwidgetDroplet
     let context: ExpandedSurfaceContext
@@ -612,12 +644,6 @@ private struct CommandsSurface: View {
 
         VStack(alignment: .leading, spacing: DroppySpacing.md) {
             searchField
-
-            if let noticeText {
-                Text(verbatim: noticeText)
-                    .font(.system(size: 12))
-                    .foregroundStyle(AdaptiveColors.notchSurfaceSecondaryText)
-            }
 
             if rankedRows.isEmpty {
                 Spacer(minLength: 0)
@@ -647,6 +673,13 @@ private struct CommandsSurface: View {
                         if let id { proxy.scrollTo(id) }
                     }
                 }
+            }
+
+            if let noticeText {
+                Text(verbatim: noticeText)
+                    .font(.system(size: 12))
+                    .foregroundStyle(AdaptiveColors.notchSurfaceSecondaryText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .padding(DroppySpacing.xl)
@@ -703,6 +736,7 @@ private struct CommandsSurface: View {
         switch droplet.notice {
         case .waitingForScan: return "Aguardando terminar a leitura dos menus de \(appName) para executar"
         case .unavailable: return "Este comando só pode ser executado depois de uma leitura atual dos menus"
+        case .disabledNow: return "Este comando não está disponível agora"
         case nil: return nil
         }
     }
