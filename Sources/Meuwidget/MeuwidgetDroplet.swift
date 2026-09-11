@@ -323,7 +323,64 @@ extension MeuwidgetDroplet: ShelfWidgetProviding {
         AnyView(MeuwidgetWidget(droplet: self, context: context))
     }
 
-    public func makeWidgetSettingsPopover(_ id: ShelfWidgetID) -> AnyView? { nil }
+    public func makeWidgetSettingsPopover(_ id: ShelfWidgetID) -> AnyView? {
+        AnyView(MenuCacheSettingsPopover(droplet: self))
+    }
+}
+
+/// The widget's settings popover: the one control the disk cache needs, so the
+/// user can clear it without a settings pane of its own.
+private struct MenuCacheSettingsPopover: View {
+    private enum ClearState {
+        case idle, clearing, cleared, failed
+    }
+
+    @ObservedObject var droplet: MeuwidgetDroplet
+    @State private var clearState = ClearState.idle
+
+    var body: some View {
+        DropletSettingsCard {
+            DropletControlRow(
+                title: "Cache de menus",
+                icon: "internaldrive",
+                infoTip: "Títulos, atalhos de teclado e estado habilitado dos comandos de cada app, guardados só neste Mac."
+            ) {
+                HStack(spacing: DroppySpacing.sm) {
+                    if let statusText {
+                        Text(statusText)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Limpar cache", action: clear)
+                        .buttonStyle(DroppyQuietButtonStyle(size: .small))
+                        .disabled(clearState == .clearing)
+                }
+            }
+        }
+        .padding(DroppySpacing.md)
+        .frame(width: 320)
+    }
+
+    private var statusText: String? {
+        switch clearState {
+        case .idle: return nil
+        case .clearing: return "Limpando…"
+        case .cleared: return "Cache limpo"
+        case .failed: return "Não foi possível limpar"
+        }
+    }
+
+    private func clear() {
+        clearState = .clearing
+        Task {
+            do {
+                try await droplet.clearMenuCache()
+                clearState = .cleared
+            } catch {
+                clearState = .failed
+            }
+        }
+    }
 }
 
 /// The widget.
