@@ -657,6 +657,43 @@ extension MeuwidgetDroplet: ExpandedSurfaceProviding {
         return AnyView(CommandsSurface(droplet: self, context: context))
     }
 
+    /// Tall enough for the search field and several command rows.
+    ///
+    /// The host's standard content height is 93 points, and the field with the
+    /// surface's own padding fills all of it: the list was laid out into the
+    /// point or so left over, so no command was ever visible, however many the
+    /// scan had found. The width stays the host's, and the height is clamped to
+    /// the ceiling the proposal carries. Any other surface id keeps the
+    /// default and takes the standard size.
+    public func expandedSurfaceSize(
+        _ id: ExpandedSurfaceID,
+        fitting proposal: ExpandedSurfaceSizeProposal
+    ) -> CGSize? {
+        guard id == Self.commandsSurfaceID else { return nil }
+        return CGSize(
+            width: proposal.standardSize.width,
+            height: min(CommandsSurfaceMetrics.preferredHeight, proposal.maximumSize.height)
+        )
+    }
+
+    /// What the commands surface is laid out from, so the height the droplet
+    /// asks for and the view that fills it stay in step. Every number here is
+    /// a font size or a `DroppySpacing` step `CommandsSurface` uses.
+    enum CommandsSurfaceMetrics {
+        /// Rows visible before the list scrolls.
+        static let visibleRows = 6
+        /// The search field: 15pt text inside `smd` vertical padding.
+        static let searchFieldHeight: CGFloat = 18 + DroppySpacing.smd * 2
+        /// One command row: 13pt text inside `xsm` vertical padding.
+        static let rowHeight: CGFloat = 16 + DroppySpacing.xsm * 2
+        /// The surface's own padding, on the top and bottom edges.
+        static let verticalPadding: CGFloat = DroppySpacing.xl * 2
+        /// The content height for `visibleRows` rows, before the host clamps it.
+        static var preferredHeight: CGFloat {
+            verticalPadding + searchFieldHeight + DroppySpacing.md + rowHeight * CGFloat(visibleRows)
+        }
+    }
+
     public func expandedSurfaceDidDismiss(
         _ id: ExpandedSurfaceID,
         presentation: ExpandedSurfacePresentation,
