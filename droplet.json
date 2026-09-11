@@ -27,7 +27,7 @@
   },
   "source": {
     "repository": "https://github.com/satelite-machi/cmdglass",
-    "commit": "",
+    "commit": "204a88f9e1f529bb81adb7d6aba99169405aafa1",
     "license": "MIT"
   },
   "keywords": []
