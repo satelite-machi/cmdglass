@@ -77,10 +77,19 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
     static let shortcutID = "open-commands"
     static let commandsSurfaceID: ExpandedSurfaceID = "commands"
 
-    /// Cmd+Shift+Y. The key code is `kVK_ANSI_Y` and the modifiers are Carbon's
-    /// `cmdKey | shiftKey`, written as literals so the droplet does not import
-    /// Carbon. The host drops it if the user already has something on it.
-    static let defaultShortcut = DropletKeyboardShortcut(keyCode: 0x10, modifiers: 0x0100 | 0x0200)
+    /// Cmd+Shift+Y. The key code is `kVK_ANSI_Y`, written as a literal so the
+    /// droplet does not import Carbon. The host drops it if the user already has
+    /// something on it.
+    ///
+    /// The modifiers are `NSEvent.ModifierFlags` raw values, not the Carbon mask
+    /// DroppyKit's doc comment for `DropletKeyboardShortcut.modifiers` names.
+    /// Droppy records its own shortcuts in the Cocoa form (0x1e0000 for
+    /// Control-Option-Shift-Command), and Carbon's `cmdKey | shiftKey` (0x300)
+    /// holds none of those bits, so the host bound it to Y with no modifiers.
+    static let defaultShortcut = DropletKeyboardShortcut(
+        keyCode: 0x10,
+        modifiers: NSEvent.ModifierFlags([.command, .shift]).rawValue
+    )
 
     private var host: DropletHost?
     private var diskCache: MenuCommandDiskCache?
