@@ -17,30 +17,7 @@ public final class MeuwidgetPrincipal: NSObject, DropletPrincipal {
     @MainActor public func makeDroplet() -> AnyObject { MeuwidgetDroplet() }
 }
 
-// MARK: - Palette model
-
-/// One row of the palette.
-struct PaletteRow: Identifiable, Equatable, Sendable {
-    /// The command's position in the list it came from.
-    let id: Int
-    let fullTitle: String
-    let shortcut: String?
-    let isEnabled: Bool
-
-    init(id: Int, command: MenuCommand) {
-        self.id = id
-        fullTitle = command.fullTitle
-        shortcut = command.shortcut?.displayString
-        isEnabled = command.isEnabled
-    }
-
-    init(id: Int, cached: CachedMenuCommand) {
-        self.id = id
-        fullTitle = cached.fullTitle
-        shortcut = cached.shortcutDisplay
-        isEnabled = cached.isEnabled
-    }
-}
+// MARK: - Palette state
 
 /// What the palette is doing, for the line it shows when it has no rows.
 enum PaletteStatus: Equatable {
@@ -58,13 +35,32 @@ enum PaletteStatus: Equatable {
     case failed
 }
 
+/// Why confirming a row did not run anything.
+enum PaletteNotice: Equatable {
+    /// The row has no live command yet, and the scan that will provide one is
+    /// still running.
+    case waitingForScan
+    /// The row has no live command, and no scan is coming to provide one.
+    case unavailable
+}
+
 /// The latest scan's commands, with their live AX references.
 ///
 /// Exists only while the surface is open, so the command the user picks can be
-/// run without walking the menu bar again. Never written anywhere.
+/// pressed without walking the menu bar again. Never written anywhere.
 private struct LiveMenuCommands {
-    let scanID: UUID
     let result: MenuScanResult
+    /// The first command at each path.
+    let firstIndexByPath: [[String]: Int]
+
+    init(result: MenuScanResult) {
+        self.result = result
+        var firstIndexByPath: [[String]: Int] = [:]
+        for (index, command) in result.commands.enumerated() where firstIndexByPath[command.path] == nil {
+            firstIndexByPath[command.path] = index
+        }
+        self.firstIndexByPath = firstIndexByPath
+    }
 }
 
 // MARK: - Droplet
@@ -86,27 +82,44 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
 
     private var host: DropletHost?
     private var diskCache: MenuCommandDiskCache?
+    private var usageStore: MenuCommandUsageStore?
     private let scanner = MenuCommandScanner()
+    private let executor = MenuCommandExecutor()
     private var permissionTask: Task<Void, Never>?
+    private var executionTask: Task<Void, Never>?
     private var presentation: ExpandedSurfacePresentation?
 
     /// The palette opened by the latest shortcut press. Work that finishes for
     /// an older one is dropped.
     private var sessionID: UUID?
     private var sessionTask: Task<Void, Never>?
+    /// The app the open palette reads, captured when the shortcut fired.
+    private var target: MenuScanTarget?
     private var liveCommands: LiveMenuCommands?
-    /// The live scan `rows` came from, or `nil` while they come from the disk.
-    private var rowsScanID: UUID?
+    /// Whether `rows` came from a live scan rather than the disk.
+    private var rowsAreLive = false
 
     /// The search field's text. Cleared every time the surface opens.
-    @Published var query = ""
+    @Published var query = "" {
+        didSet {
+            selectedPath = nil
+            notice = nil
+        }
+    }
     @Published private(set) var rows: [PaletteRow] = []
     @Published private(set) var status: PaletteStatus = .idle
     @Published private(set) var targetName: String?
+    /// The target app's command usage, for ranking.
+    @Published private(set) var usage: [[String]: MenuCommandUsage] = [:]
+    /// The selected row, by path so it survives re-ranking and the switch from
+    /// cached to live rows. `nil` selects the first row.
+    @Published private(set) var selectedPath: [String]?
+    @Published private(set) var notice: PaletteNotice?
 
     public func activate(host: DropletHost) throws {
         self.host = host
         diskCache = MenuCommandDiskCache(containerDirectory: host.environment.containerDirectory)
+        usageStore = MenuCommandUsageStore(containerDirectory: host.environment.containerDirectory)
         // Needs `global-shortcuts`; without it the host refuses and logs, and
         // the shelf widget keeps working.
         host.shortcuts.register(
@@ -124,6 +137,8 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
         // code, so anything left running keeps running until Droppy relaunches.
         permissionTask?.cancel()
         permissionTask = nil
+        executionTask?.cancel()
+        executionTask = nil
         endSession()
         if presentation != nil {
             host?.notchSurface.dismissExpandedSurface(Self.commandsSurfaceID)
@@ -131,6 +146,7 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
         presentation = nil
         host?.shortcuts.unregister(id: Self.shortcutID)
         diskCache = nil
+        usageStore = nil
         host = nil
     }
 
@@ -173,8 +189,8 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
 
     // MARK: Palette session
 
-    /// Opens the surface for `target` and fills it: the disk cache first, when
-    /// there is one, then a fresh scan of that app alone.
+    /// Opens the surface for `target` and fills it: usage and the disk cache
+    /// first, when there are any, then a fresh scan of that app alone.
     private func openPalette(for target: MenuScanTarget?, canScan: Bool) {
         guard presentCommands() else { return }
         endSession()
@@ -183,19 +199,25 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
             status = .noTargetApp
             return
         }
+        self.target = target
         targetName = target.localizedName
         status = canScan ? .scanning : .needsAccessibility
 
         let sessionID = UUID()
         self.sessionID = sessionID
         let cache = diskCache
+        let usageStore = usageStore
         let scanner = scanner
 
-        // Off the main actor: the disk read and, above all, the scan, which is
+        // Off the main actor: the file reads and, above all, the scan, which is
         // a synchronous message to the app per menu item.
         sessionTask = Task.detached(priority: .userInitiated) { [weak self] in
-            let key = MenuCacheKey.resolve(for: target)
+            if let bundleIdentifier = target.bundleIdentifier, let usageStore {
+                let usage = await usageStore.usage(forBundleIdentifier: bundleIdentifier)
+                await self?.showUsage(usage, sessionID: sessionID)
+            }
 
+            let key = MenuCacheKey.resolve(for: target)
             if let key, let cache, let cached = await cache.load(key) {
                 let cachedRows = cached.commands.enumerated().map { PaletteRow(id: $0.offset, cached: $0.element) }
                 await self?.showCachedRows(cachedRows, sessionID: sessionID)
@@ -213,7 +235,7 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
                     do {
                         try await cache.save(CachedMenu(key: key, result: result), generation: generation)
                     } catch {
-                        await self?.logCacheWriteFailure(String(describing: error))
+                        await self?.logFailure("could not write the menu cache: \(error)")
                     }
                 }
             } catch {
@@ -222,9 +244,14 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
         }
     }
 
+    private func showUsage(_ usage: [[String]: MenuCommandUsage], sessionID: UUID) {
+        guard sessionID == self.sessionID else { return }
+        self.usage = usage
+    }
+
     private func showCachedRows(_ cachedRows: [PaletteRow], sessionID: UUID) {
         // A scan that already landed is newer than the disk.
-        guard sessionID == self.sessionID, rowsScanID == nil else { return }
+        guard sessionID == self.sessionID, !rowsAreLive else { return }
         rows = cachedRows
     }
 
@@ -239,47 +266,165 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
         // The surface closed, or another press replaced this palette: the
         // references are not kept.
         guard sessionID == self.sessionID, presentation != nil else { return }
-        let scanID = UUID()
-        liveCommands = LiveMenuCommands(scanID: scanID, result: result)
+        liveCommands = LiveMenuCommands(result: result)
         rows = liveRows
-        rowsScanID = scanID
+        rowsAreLive = true
         status = .ready
+        if notice == .waitingForScan { notice = nil }
     }
 
     private func scanDidFail(_ error: MenuScanError, sessionID: UUID) {
         guard sessionID == self.sessionID, error != .cancelled else { return }
-        host?.log.notice("menu scan of \(targetName ?? "the frontmost app") failed: \(error)")
+        host?.log.notice("menu scan failed: \(error)")
         status = error == .accessibilityNotAuthorized ? .needsAccessibility : .failed
+        if notice == .waitingForScan { notice = .unavailable }
     }
 
-    private func logCacheWriteFailure(_ description: String) {
-        host?.log.error("could not write the menu cache: \(description)")
-    }
-
-    /// The live command behind a palette row, for running it. `nil` while the
-    /// rows still come from the disk cache, and once the surface has closed.
-    func liveCommand(for row: PaletteRow) -> MenuCommand? {
-        guard let liveCommands, rowsScanID == liveCommands.scanID,
-              liveCommands.result.commands.indices.contains(row.id) else { return nil }
-        return liveCommands.result.commands[row.id]
+    private func logFailure(_ message: String) {
+        host?.log.error(message)
     }
 
     /// Ends the palette's session: stops its scan, forgets the live references
-    /// and empties what the surface shows.
+    /// and empties what the surface shows. A command already being pressed
+    /// carries on.
     private func endSession() {
         sessionTask?.cancel()
         sessionTask = nil
         sessionID = nil
+        target = nil
         liveCommands = nil
-        rowsScanID = nil
+        rowsAreLive = false
         rows = []
+        usage = [:]
         status = .idle
         targetName = nil
         query = ""
+        selectedPath = nil
+        notice = nil
     }
+
+    // MARK: Selection and running
+
+    /// The rows in the order they are shown: match relevance, then frequency,
+    /// then recency.
+    var rankedRows: [PaletteRow] {
+        PaletteRanking.rank(rows, query: query, usage: usage)
+    }
+
+    func selectedRow(in rankedRows: [PaletteRow]) -> PaletteRow? {
+        rankedRows.first { $0.path == selectedPath } ?? rankedRows.first
+    }
+
+    func moveSelection(by offset: Int) {
+        let ranked = rankedRows
+        guard !ranked.isEmpty else { return }
+        let current = ranked.firstIndex { $0.path == selectedPath } ?? 0
+        selectedPath = ranked[min(max(current + offset, 0), ranked.count - 1)].path
+        notice = nil
+    }
+
+    func confirmSelection() {
+        guard let row = selectedRow(in: rankedRows) else { return }
+        confirm(row)
+    }
+
+    /// The live command behind a palette row, found by its path. `nil` when
+    /// there is nothing safe to press: the rows still come from the disk, the
+    /// scan has not finished, or there is no permission to scan.
+    func liveCommand(for row: PaletteRow) -> MenuCommand? {
+        guard let liveCommands else { return nil }
+        let commands = liveCommands.result.commands
+        // The same position almost always holds the same command; the path
+        // decides.
+        if commands.indices.contains(row.id), commands[row.id].path == row.path {
+            return commands[row.id]
+        }
+        return liveCommands.firstIndexByPath[row.path].map { commands[$0] }
+    }
+
+    /// Runs the command behind `row`, if there is a live one to press.
+    ///
+    /// The row's enabled state is only what the scan saw, and an app that was
+    /// not active then can report most of its items disabled, so it decides
+    /// nothing here. The surface closes and the target app comes forward first;
+    /// then the executor reads the item's enabled state again from its live
+    /// reference and presses it only if the app reports it enabled at that
+    /// moment. A refused or failed press is logged; the surface is already
+    /// closed.
+    func confirm(_ row: PaletteRow) {
+        selectedPath = row.path
+        guard executionTask == nil else { return }
+        guard let command = liveCommand(for: row), let target else {
+            // Never a reference from an older scan: wait for this one.
+            notice = status == .scanning ? .waitingForScan : .unavailable
+            return
+        }
+
+        let usageStore = usageStore
+        let executor = executor
+
+        // Dismissing ends the session and drops the live references, which is
+        // why the command and the target are captured above.
+        host?.notchSurface.dismissExpandedSurface(Self.commandsSurfaceID)
+
+        executionTask = Task { [weak self] in
+            let isFrontmost = await Self.bringForward(target)
+            let failure = await Task.detached(priority: .userInitiated) { () -> MenuCommandPressError? in
+                do throws(MenuCommandPressError) {
+                    try executor.press(command)
+                    return nil
+                } catch {
+                    return error
+                }
+            }.value
+
+            guard let self else { return }
+            self.executionTask = nil
+            if !isFrontmost {
+                self.host?.log.notice("the target app did not come forward before the press")
+            }
+            if let failure {
+                if failure == .disabled {
+                    self.host?.log.notice("the menu command was still disabled when it was pressed; nothing ran")
+                } else {
+                    self.host?.log.notice("pressing the menu command failed: \(failure)")
+                }
+                return
+            }
+            if let bundleIdentifier = target.bundleIdentifier, let usageStore {
+                do {
+                    try await usageStore.recordUse(of: command.path, bundleIdentifier: bundleIdentifier)
+                } catch {
+                    self.host?.log.error("could not record command usage: \(error)")
+                }
+            }
+        }
+    }
+
+    /// Asks for `target` to become the active app and waits, at most half a
+    /// second, until it is. Activation is cooperative since macOS 14: Droppy
+    /// yields it, the target takes it, and the system may still decline.
+    private static func bringForward(_ target: MenuScanTarget) async -> Bool {
+        let pid = target.processIdentifier
+        guard let application = NSRunningApplication(processIdentifier: pid), !application.isTerminated else {
+            return false
+        }
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid { return true }
+
+        NSApp.yieldActivation(to: application)
+        application.activate(from: .current, options: [])
+        for _ in 0..<25 {
+            try? await Task.sleep(for: .milliseconds(20))
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid { return true }
+        }
+        return false
+    }
+
+    // MARK: Cache
 
     /// Deletes every menu cached on disk. A scan already running does not write
     /// its result back; the palette that is open keeps showing what it has.
+    /// Command usage is kept.
     public func clearMenuCache() async throws {
         guard let diskCache else { return }
         try await diskCache.removeAll()
@@ -453,17 +598,28 @@ extension MeuwidgetDroplet: ExpandedSurfaceHosting {
 }
 
 /// The commands surface: a search field over the app's menu commands.
+///
+/// Up and down move the selection, Return runs it, and a click runs the row
+/// clicked.
 private struct CommandsSurface: View {
     @ObservedObject var droplet: MeuwidgetDroplet
     let context: ExpandedSurfaceContext
     @FocusState private var isSearchFocused: Bool
 
     var body: some View {
-        let visibleRows = filteredRows
+        let rankedRows = droplet.rankedRows
+        let selectedID = droplet.selectedRow(in: rankedRows)?.id
+
         VStack(alignment: .leading, spacing: DroppySpacing.md) {
             searchField
 
-            if visibleRows.isEmpty {
+            if let noticeText {
+                Text(verbatim: noticeText)
+                    .font(.system(size: 12))
+                    .foregroundStyle(AdaptiveColors.notchSurfaceSecondaryText)
+            }
+
+            if rankedRows.isEmpty {
                 Spacer(minLength: 0)
                 Text(verbatim: placeholder)
                     .font(.system(size: 13))
@@ -472,11 +628,23 @@ private struct CommandsSurface: View {
                     .frame(maxWidth: .infinity)
                 Spacer(minLength: 0)
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(visibleRows) { row in
-                            CommandRow(row: row)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(rankedRows) { row in
+                                CommandRow(
+                                    row: row,
+                                    isSelected: row.id == selectedID,
+                                    isRunnable: droplet.liveCommand(for: row) != nil
+                                )
+                                .id(row.id)
+                                .contentShape(Rectangle())
+                                .onTapGesture { droplet.confirm(row) }
+                            }
                         }
+                    }
+                    .onChange(of: selectedID) { _, id in
+                        if let id { proxy.scrollTo(id) }
                     }
                 }
             }
@@ -503,6 +671,15 @@ private struct CommandsSurface: View {
             .font(.system(size: 15))
             .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText)
             .focused($isSearchFocused)
+            .onSubmit { droplet.confirmSelection() }
+            .onKeyPress(.downArrow) {
+                droplet.moveSelection(by: 1)
+                return .handled
+            }
+            .onKeyPress(.upArrow) {
+                droplet.moveSelection(by: -1)
+                return .handled
+            }
 
             if droplet.status == .scanning, !droplet.rows.isEmpty {
                 Text("Atualizando")
@@ -518,28 +695,38 @@ private struct CommandsSurface: View {
         )
     }
 
-    private var filteredRows: [PaletteRow] {
-        let query = droplet.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return droplet.rows }
-        return droplet.rows.filter { $0.fullTitle.localizedStandardContains(query) }
+    private var appName: String {
+        droplet.targetName ?? "o app em uso"
+    }
+
+    private var noticeText: String? {
+        switch droplet.notice {
+        case .waitingForScan: return "Aguardando terminar a leitura dos menus de \(appName) para executar"
+        case .unavailable: return "Este comando só pode ser executado depois de uma leitura atual dos menus"
+        case nil: return nil
+        }
     }
 
     private var placeholder: String {
         if !droplet.rows.isEmpty { return "Nenhum comando corresponde à busca" }
-        let app = droplet.targetName ?? "o app em uso"
         switch droplet.status {
         case .idle: return "Nenhum comando carregado ainda"
         case .noTargetApp: return "Nenhum app em uso para ler os menus"
         case .needsAccessibility: return "Sem acesso de Acessibilidade, os menus não podem ser lidos"
-        case .scanning: return "Lendo os menus de \(app)…"
-        case .ready: return "Nenhum comando encontrado em \(app)"
-        case .failed: return "Não foi possível ler os menus de \(app)"
+        case .scanning: return "Lendo os menus de \(appName)…"
+        case .ready: return "Nenhum comando encontrado em \(appName)"
+        case .failed: return "Não foi possível ler os menus de \(appName)"
         }
     }
 }
 
 private struct CommandRow: View {
     let row: PaletteRow
+    let isSelected: Bool
+    /// Whether a live command stands behind the row. A row from the disk
+    /// cache is shown but cannot run until the scan lands. A row the scan saw
+    /// disabled is only dimmed: it can still be selected and confirmed.
+    let isRunnable: Bool
 
     var body: some View {
         HStack(spacing: DroppySpacing.md) {
@@ -551,7 +738,11 @@ private struct CommandRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: DroppySpacing.sm)
-            if let shortcut = row.shortcut {
+            if isSelected, !isRunnable {
+                Text("Aguardando")
+                    .font(.system(size: 11))
+                    .foregroundStyle(AdaptiveColors.notchSurfaceTertiaryText)
+            } else if let shortcut = row.shortcut {
                 Text(verbatim: shortcut)
                     .font(.system(size: 12))
                     .foregroundStyle(AdaptiveColors.notchSurfaceTertiaryText)
@@ -559,5 +750,11 @@ private struct CommandRow: View {
         }
         .padding(.horizontal, DroppySpacing.md)
         .padding(.vertical, DroppySpacing.xsm)
+        .background {
+            if isSelected {
+                RoundedRectangle(cornerRadius: DroppyRadius.small, style: .continuous)
+                    .fill(AdaptiveColors.notchSurfaceCardFill)
+            }
+        }
     }
 }

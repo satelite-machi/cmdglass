@@ -15,6 +15,8 @@
 //  - It registers no AXObserver, runs no timer and keeps no state between
 //    calls. One call is one read of one app's menu bar, and cancelling the
 //    task running it stops the read.
+//  - The Apple menu and the system Services submenu are skipped without
+//    reading into them: neither holds the app's own commands.
 //
 
 import AppKit
@@ -157,9 +159,8 @@ public struct MenuKeyboardShortcut: Sendable, Hashable {
 ///
 /// `AXUIElement` is an immutable Core Foundation handle, so carrying it across
 /// isolation domains is safe; every use of it is still a message to the target
-/// app. The handle goes stale when the app rebuilds that menu, and a stale
-/// handle fails with `kAXErrorInvalidUIElement`. ``MenuCommand/path`` is there
-/// to find the item again.
+/// app. The handle can go stale when the app rebuilds that menu.
+/// ``MenuCommand/path`` is there to find the item again.
 public struct MenuCommandReference: @unchecked Sendable {
     public let element: AXUIElement
     public let processIdentifier: pid_t
@@ -173,7 +174,9 @@ public struct MenuCommand: Sendable {
     public let fullTitle: String
     /// The app's own key equivalent, when it has one.
     public let shortcut: MenuKeyboardShortcut?
-    /// False when the item or any menu above it is disabled.
+    /// Whether the item and every menu above it were enabled when the scan read
+    /// them. Only a snapshot: an app that is not active can report most of its
+    /// items disabled. ``MenuCommandExecutor/press(_:)`` reads it again.
     public let isEnabled: Bool
     public let reference: MenuCommandReference
 
@@ -189,7 +192,7 @@ public struct MenuCommand: Sendable {
 /// What one scan found.
 public struct MenuScanResult: Sendable {
     public let target: MenuScanTarget
-    /// In menu order, the Apple menu excluded.
+    /// In menu order, the Apple menu and the Services submenu excluded.
     public let commands: [MenuCommand]
     /// True when the scan stopped at ``MenuCommandScanner/Limits/maximumCommands``
     /// or skipped menus nested deeper than ``MenuCommandScanner/Limits/maximumDepth``.
@@ -292,13 +295,14 @@ private struct ScanSession {
         }
 
         // The first menu bar item is the Apple menu. It is skipped without
-        // reading anything from it.
-        for item in barItems.dropFirst() {
+        // reading anything from it. The second is the application menu, which
+        // holds the Services submenu.
+        for (index, item) in barItems.enumerated().dropFirst() {
             guard commands.count < limits.maximumCommands else {
                 isTruncated = true
                 break
             }
-            try visitMenuBarItem(item)
+            try visitMenuBarItem(item, isApplicationMenu: index == 1)
         }
 
         return MenuScanResult(target: target, commands: commands, isTruncated: isTruncated)
@@ -306,11 +310,17 @@ private struct ScanSession {
 
     // MARK: Walking
 
-    private mutating func visitMenuBarItem(_ item: AXUIElement) throws(MenuScanError) {
+    private mutating func visitMenuBarItem(_ item: AXUIElement, isApplicationMenu: Bool) throws(MenuScanError) {
         guard let attributes = try read(item, [kAXTitleAttribute, kAXEnabledAttribute, kAXChildrenAttribute]),
               let title = Self.title(attributes) else { return }
         let isEnabled = attributes[kAXEnabledAttribute] as? Bool ?? true
-        try visitMenus(in: attributes, path: [title], parentEnabled: isEnabled, depth: 1)
+        try visitMenus(
+            in: attributes,
+            path: [title],
+            parentEnabled: isEnabled,
+            depth: 1,
+            isApplicationMenu: isApplicationMenu
+        )
     }
 
     /// Walks every `AXMenu` among an element's children. Returns whether there
@@ -320,7 +330,8 @@ private struct ScanSession {
         in attributes: [String: AnyObject],
         path: [String],
         parentEnabled: Bool,
-        depth: Int
+        depth: Int,
+        isApplicationMenu: Bool
     ) throws(MenuScanError) -> Bool {
         var foundMenu = false
         for child in Self.elements(attributes[kAXChildrenAttribute]) ?? [] {
@@ -337,7 +348,13 @@ private struct ScanSession {
                     isTruncated = true
                     return foundMenu
                 }
-                try visitMenuItem(item, path: path, parentEnabled: parentEnabled, depth: depth)
+                try visitMenuItem(
+                    item,
+                    path: path,
+                    parentEnabled: parentEnabled,
+                    depth: depth,
+                    isApplicationMenu: isApplicationMenu
+                )
             }
         }
         return foundMenu
@@ -347,16 +364,29 @@ private struct ScanSession {
         _ item: AXUIElement,
         path: [String],
         parentEnabled: Bool,
-        depth: Int
+        depth: Int,
+        isApplicationMenu: Bool
     ) throws(MenuScanError) {
         // Separators have no title, and neither does anything that vanished.
         guard let attributes = try read(item, Self.menuItemAttributes),
               let title = Self.title(attributes) else { return }
 
+        // Services is the system's menu, not the app's. Like the Apple menu it
+        // is skipped whole, before anything inside it is read.
+        if isApplicationMenu, depth == 1, Self.isServicesTitle(title) {
+            return
+        }
+
         let isEnabled = parentEnabled && (attributes[kAXEnabledAttribute] as? Bool ?? true)
         let itemPath = path + [title]
 
-        if try visitMenus(in: attributes, path: itemPath, parentEnabled: isEnabled, depth: depth + 1) {
+        if try visitMenus(
+            in: attributes,
+            path: itemPath,
+            parentEnabled: isEnabled,
+            depth: depth + 1,
+            isApplicationMenu: false
+        ) {
             return
         }
 
@@ -368,6 +398,18 @@ private struct ScanSession {
                 reference: MenuCommandReference(element: item, processIdentifier: pid)
             )
         )
+    }
+
+    /// Whether a top-level item of the application menu is the Services
+    /// submenu, recognized by its English title alone.
+    ///
+    /// Nothing else in its AX attributes marks it: in TextEdit it has no
+    /// subrole, and its identifiers are generated (`_NS:848` for the item,
+    /// `_NS:852` for its menu). An app whose menus are in another language
+    /// titles it differently, so for now that app's Services items stay in the
+    /// list.
+    private static func isServicesTitle(_ title: String) -> Bool {
+        title.compare("Services", options: .caseInsensitive) == .orderedSame
     }
 
     // MARK: Reading
