@@ -91,6 +91,15 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
         modifiers: NSEvent.ModifierFlags([.command, .shift]).rawValue
     )
 
+    /// The HUD that explains a surface Droppy closed as it opened.
+    static let autoCollapseHintID = "auto-collapse-hint"
+    /// Names the setting as Droppy's Settings show it, under Shelf, Behavior.
+    static let autoCollapseHint = "Se a barra fechar sozinha, desligue Auto-collapse nas preferências do Droppy."
+    /// A dismissal the host reports as the user's, this soon after presenting,
+    /// is taken to be Droppy's Auto-collapse: nobody reads the palette and
+    /// clicks away inside a second.
+    static let autoCollapseWindow: Duration = .seconds(1)
+
     private var host: DropletHost?
     private var diskCache: MenuCommandDiskCache?
     private var usageStore: MenuCommandUsageStore?
@@ -99,6 +108,8 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
     private var permissionTask: Task<Void, Never>?
     private var executionTask: Task<Void, Never>?
     private var presentation: ExpandedSurfacePresentation?
+    /// When `presentation` went up.
+    private var presentedAt: ContinuousClock.Instant?
 
     /// The palette opened by the latest shortcut press. Work that finishes for
     /// an older one is dropped.
@@ -155,6 +166,8 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
             host?.notchSurface.dismissExpandedSurface(Self.commandsSurfaceID)
         }
         presentation = nil
+        presentedAt = nil
+        host?.hud.dismiss(id: Self.autoCollapseHintID)
         host?.shortcuts.unregister(id: Self.shortcutID)
         diskCache = nil
         usageStore = nil
@@ -485,6 +498,7 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
         presentation = host.notchSurface.presentExpandedSurface(
             ExpandedSurfacePresentationRequest(surfaceID: Self.commandsSurfaceID, opensShelf: true)
         )
+        presentedAt = presentation == nil ? nil : .now
         if presentation == nil {
             host.log.notice("host refused to present the commands surface")
         }
@@ -617,7 +631,9 @@ extension MeuwidgetDroplet: ExpandedSurfaceProviding {
                 systemImage: "command",
                 // The user types into this with the pointer elsewhere, so the
                 // host's pointer-based auto-collapse would close it under them.
-                // Clicking away and swiping still dismiss it.
+                // Clicking away and swiping still dismiss it. Droppy's
+                // Auto-collapse setting closes it anyway; see
+                // presentAutoCollapseHint().
                 suppresses: [.shelfWidgets, .autoCollapse]
             )
         ]
@@ -635,14 +651,91 @@ extension MeuwidgetDroplet: ExpandedSurfaceProviding {
     ) {
         // A late teardown can arrive after the shortcut summoned a fresh one.
         guard presentation == self.presentation else { return }
+        let shownFor = presentedAt.map { ContinuousClock.now - $0 }
         self.presentation = nil
+        presentedAt = nil
         // The live references only live while the surface is open.
         endSession()
+        if reason == .userCollapsedShelf, let shownFor, shownFor < Self.autoCollapseWindow {
+            presentAutoCollapseHint()
+        }
     }
 }
 
 extension MeuwidgetDroplet: ExpandedSurfaceHosting {
     public var expandedSurfaceProvider: (any ExpandedSurfaceProviding)? { self }
+}
+
+// MARK: - HUD
+
+extension MeuwidgetDroplet: HUDPresenting {
+    /// Says why the commands surface closed as it opened, on the notch, where
+    /// the user sees it without opening anything.
+    ///
+    /// Droppy's Auto-collapse setting closes the surface even though its
+    /// descriptor suppresses `.autoCollapse`, whenever the pointer is away from
+    /// the notch, which is where it is after a shortcut. Seen in Droppy
+    /// Playground 1.0.6: open for as long as it was watched with the setting
+    /// off, closed within a second with it on. DroppyKit exposes no host
+    /// preference, so the droplet cannot check the setting; it reacts to the
+    /// dismissal instead, and a real click away inside a second shows the same
+    /// notice.
+    private func presentAutoCollapseHint() {
+        guard let host else { return }
+        let message = Self.autoCollapseHint
+        // The card's content is 344pt wide on a notch and 208 on an island,
+        // where the sentence needs more lines.
+        let height: CGFloat = host.environment.notchGeometry.isHardwareNotch ? 56 : 88
+        let request = DropletHUDRequest(
+            id: Self.autoCollapseHintID,
+            duration: 6,
+            accessibilityLabel: message,
+            isExpanded: true,
+            expandedContentHeight: height
+        ) {
+            AutoCollapseHintStrip()
+        } expanded: {
+            AutoCollapseHintCard(message: message)
+        }
+        if !host.hud.present(request) {
+            host.log.notice("host refused the auto-collapse notice")
+        }
+    }
+}
+
+/// The notice's strip, for a host that draws it: the glyph at the far left and
+/// the setting's name at the far right, nothing across the camera housing.
+private struct AutoCollapseHintStrip: View {
+    var body: some View {
+        HStack(spacing: 0) {
+            Image(systemName: "arrow.down.right.and.arrow.up.left")
+                .font(.system(size: DroppyLiveActivityMetrics.iconSize, weight: .semibold))
+            Spacer(minLength: 0)
+            Text("Auto-collapse")
+                .font(.system(size: DroppyLiveActivityMetrics.labelFontSize, weight: .semibold))
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+        .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText)
+    }
+}
+
+/// The notice's card: which droplet is speaking, then the sentence.
+private struct AutoCollapseHintCard: View {
+    let message: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DroppySpacing.xs) {
+            Text("Meu Widget")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(AdaptiveColors.notchSurfaceSecondaryText)
+            Text(verbatim: message)
+                .font(.system(size: 13))
+                .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
 }
 
 /// The commands surface: a search field over the app's menu commands.
