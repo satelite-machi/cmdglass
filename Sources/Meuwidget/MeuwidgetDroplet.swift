@@ -446,6 +446,19 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
         }
     }
 
+    /// Closes the palette at the user's request, from Escape in the search
+    /// field or the close button.
+    ///
+    /// The palette's own way out. With Droppy's Auto-collapse off, clicking
+    /// outside and hovering did not close it in Droppy Playground 1.0.6, so
+    /// without this it stayed up until a command ran. The
+    /// host reports this as `dropletRequested`, which never shows the
+    /// Auto-collapse notice.
+    func closePalette() {
+        guard presentation != nil else { return }
+        host?.notchSurface.dismissExpandedSurface(Self.commandsSurfaceID)
+    }
+
     /// Whether the presentation a row was confirmed from is still on screen,
     /// by the host's account as well as ours.
     private func isStillPresented(_ confirmedPresentation: ExpandedSurfacePresentation?) -> Bool {
@@ -741,7 +754,8 @@ private struct AutoCollapseHintCard: View {
 /// The commands surface: a search field over the app's menu commands.
 ///
 /// Up and down move the selection, Return runs it, and a click runs the row
-/// clicked. Why a confirmation did not run anything shows in the footer.
+/// clicked. Escape and the close button close the palette. Why a confirmation
+/// did not run anything shows in the footer.
 private struct CommandsSurface: View {
     @ObservedObject var droplet: MeuwidgetDroplet
     let context: ExpandedSurfaceContext
@@ -828,12 +842,27 @@ private struct CommandsSurface: View {
                 droplet.moveSelection(by: -1)
                 return .handled
             }
+            // Escape reaches a focused field as the Cancel action.
+            .onExitCommand {
+                droplet.closePalette()
+            }
 
             if droplet.status == .scanning, !droplet.rows.isEmpty {
                 Text("Atualizando")
                     .font(.system(size: 11))
                     .foregroundStyle(AdaptiveColors.notchSurfaceTertiaryText)
             }
+
+            // The same action as Escape, visible: nothing about a search field
+            // says that Escape closes the palette around it.
+            Button {
+                droplet.closePalette()
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(DroppyCircleButtonStyle(size: 20))
+            .help("Fechar (Esc)")
+            .accessibilityLabel("Fechar")
         }
         .padding(.horizontal, DroppySpacing.md)
         .padding(.vertical, DroppySpacing.smd)
