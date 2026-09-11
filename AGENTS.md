@@ -9,7 +9,7 @@ the notch, the shelf, the lock screen and the menu bar.
 
 - Droplet id: `meuwidget`. It is also `MeuwidgetDroplet.id` in Swift and `id` in `droplet.json`; the three must agree or the loader refuses the bundle.
 - Swift product: `Meuwidget`, a dynamic library. The harness target is `MeuwidgetHarness`.
-- SDK checkout: `/Users/mattrocha/droppykit` (DroppyKit 1.2.0). Docs online: https://getdroppy.app/docs/droppykit
+- SDK checkout: `/Users/mattrocha/droppykit` (DroppyKit 1.4.1). Docs online: https://getdroppy.app/docs/droppykit
 - Host: Droppy 15.3 or later, or the free Droppy Playground (https://getdroppy.app/download/playground), which loads unsigned bundles.
 
 ## The loop
@@ -44,6 +44,10 @@ The other tools are `droppykit_manifest` (a static check, no build), `droppykit_
 Settings panel with a page per surface. You cannot see that window. The shots are your
 eyes; take them after every visual change.
 
+`droppykit version` says which SDK checkout the scripts come from and which tag this
+package pins; `droppykit update` moves both to the newest release. A build that stops with
+"no compiled objects" or "DroppyKit.o not found" is an SDK older than 1.2.1: update it.
+
 ## Rules
 
 - **Surfaces and conformances agree.** `surfaces` in `droplet.json` lists what the droplet
@@ -54,6 +58,34 @@ eyes; take them after every visual change.
   `preferredPairedWidth` are required; Droppy refuses a descriptor that leaves either to a
   host fallback. Solo and paired are different compositions, not one view at two widths:
   branch on `context.isPaired`.
+- **Layout traits describe the widget's rectangle.** Every number in
+  `ShelfWidgetLayoutTraits` is the area the widget draws in, in points at the Regular shelf
+  size, exactly what the harness renders; Droppy adds its own chrome around it. `.fixed(150)`
+  is a 150-point rectangle, alone and in a row, clamped to 48 through 480. A widget that needs
+  more height declares more; it never pads its way out of a clip. A solo widget is never
+  narrower than 352 on a notch or 370 on an island, so lay out to `context.availableSize`.
+- **No card, no border around the widget.** Droppy paints nothing behind a widget and almost
+  every one of its own widgets lays its content directly on the shelf's black. Put no
+  background, fill, outline or rounded box on the widget's root view. `notchSurfaceCardFill`
+  is for a tile or a chip inside the widget that has to read as raised, never a frame.
+- **Lay the widget out like Droppy's.** The root view fills the rectangle
+  (`.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)`) with ONE
+  padding, `DroppySpacing.mdl`, the same on all four edges and nothing more: the shelf's chrome
+  is already outside it. Leading text, trailing `.monospacedDigit()` numbers, rows that span the
+  full width, a header row of a 12pt symbol and a 12pt semibold title with the widget's control
+  at its trailing end, `DroppySpacing` steps between rows. Declare the height the content
+  needs; never leave unused space or fill it with padding.
+- **The physical notch is cleared for you, except on a HUD strip.** The shelf, a takeover,
+  a HUD card and a live activity are inset past the camera housing by the host; never pad for
+  it. A HUD strip is handed the whole width across the housing: put its content at the two
+  outer edges and nothing in the middle (`host.environment.notchGeometry.closedWidth` is the
+  housing), the way the World Clock example's strip does. Never centre a strip.
+- **Buttons are Liquid Glass, Droppy's own.** `DroppyCircleButtonStyle` (20pt on an item,
+  24pt in a row) for an icon action, `DroppyQuietButtonStyle` and `DroppyAccentButtonStyle`
+  (`.small`) for labelled ones, `DroppyGlassButtonStyle` for a label with its own sizing.
+  Never a flat wash, a bordered chip or a white button of your own. A list with a control per
+  row wraps in `droppyFlatGlassControls()`. Only a live activity row's controls keep
+  `DroppyLiveActivityControlStyle`.
 - **Everything `activate(host:)` starts, `deactivate()` stops.** Timers, observers, tasks,
   connections. Swift cannot unload code, so anything left running runs until Droppy
   relaunches.

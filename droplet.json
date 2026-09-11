@@ -12,7 +12,8 @@
   "minAppVersion": "15.3.0",
   "capabilities": [
     "accessibility",
-    "global-shortcuts"
+    "global-shortcuts",
+    "expanded-surface"
   ],
   "surfaces": [
     "shelf-widget",

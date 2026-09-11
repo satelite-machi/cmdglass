@@ -12,7 +12,7 @@ let package = Package(
         .library(name: "Meuwidget", type: .dynamic, targets: ["Meuwidget"])
     ],
     dependencies: [
-        .package(url: "https://gitlab.com/droppyformac1/droppykit.git", from: "1.2.0")
+        .package(url: "https://gitlab.com/droppyformac1/droppykit.git", from: "1.4.1")
     ],
     targets: [
         .target(
