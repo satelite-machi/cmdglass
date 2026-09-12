@@ -67,7 +67,7 @@ private struct LiveMenuCommands {
 
 // MARK: - Droplet
 
-/// Meu Widget.
+/// CmdGlass.
 @MainActor
 public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
     /// Must equal `DroppyDropletID` in the bundle's Info.plist and `id` in
@@ -151,7 +151,7 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
         ) { [weak self] in
             self?.shortcutPressed()
         }
-        host.log.info("Meu Widget activated")
+        host.log.info("CmdGlass activated")
     }
 
     public func deactivate() {
@@ -554,7 +554,7 @@ extension MeuwidgetDroplet: ShelfWidgetProviding {
         [
             ShelfWidgetDescriptor(
                 id: "meuwidget",
-                title: "Meu Widget",
+                title: "CmdGlass",
                 systemImage: "drop.fill",
                 layoutTraits: ShelfWidgetLayoutTraits(
                     // Both are required. Droppy refuses a descriptor that
@@ -644,7 +644,7 @@ private struct MeuwidgetWidget: View {
             HStack(spacing: DroppySpacing.xsm) {
                 Image(systemName: "drop.fill")
                     .font(.system(size: 12, weight: .medium))
-                Text("Meu Widget")
+                Text("CmdGlass")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer(minLength: 0)
             }
@@ -804,7 +804,7 @@ private struct AutoCollapseHintCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: DroppySpacing.xs) {
-            Text("Meu Widget")
+            Text("CmdGlass")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(AdaptiveColors.notchSurfaceSecondaryText)
             Text(verbatim: message)
@@ -1111,15 +1111,35 @@ private struct CommandRow: View {
     /// disabled is only dimmed: it can still be selected and confirmed.
     let isRunnable: Bool
 
+    /// The menus above the command, in the scanner's own separator. Empty for
+    /// a command sitting directly in the menu bar.
+    private var parentPath: String {
+        row.path.dropLast().joined(separator: " > ")
+    }
+
     var body: some View {
         HStack(spacing: DroppySpacing.md) {
-            Text(verbatim: row.fullTitle)
-                .font(.system(size: 13))
-                .foregroundStyle(
-                    row.isEnabled ? AdaptiveColors.notchSurfacePrimaryText : AdaptiveColors.notchSurfaceTertiaryText
-                )
-                .lineLimit(1)
-                .truncationMode(.middle)
+            // The command's own name carries the row; the menus above it are
+            // context, so they follow it small and faint and give up their
+            // width first. One line, because the row's height is what
+            // CommandsSurfaceMetrics sizes the surface from.
+            HStack(alignment: .firstTextBaseline, spacing: DroppySpacing.xsm) {
+                Text(verbatim: row.path.last ?? row.fullTitle)
+                    .font(.system(size: 13))
+                    .foregroundStyle(
+                        row.isEnabled ? AdaptiveColors.notchSurfacePrimaryText : AdaptiveColors.notchSurfaceTertiaryText
+                    )
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .layoutPriority(1)
+                if !parentPath.isEmpty {
+                    Text(verbatim: parentPath)
+                        .font(.system(size: 11))
+                        .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText.opacity(0.35))
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+            }
             Spacer(minLength: DroppySpacing.sm)
             if isSelected, !isRunnable {
                 Text("Aguardando")
