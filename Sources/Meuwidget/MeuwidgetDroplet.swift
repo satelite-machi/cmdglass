@@ -794,6 +794,10 @@ private struct AutoCollapseHintCard: View {
 /// clicked. Escape and the close button close the palette. Why a confirmation
 /// did not run anything shows in the footer.
 private struct CommandsSurface: View {
+    /// The search field's type size. The caret is laid out from the same
+    /// number, so it stays with the text it follows.
+    static let searchFont: CGFloat = 15
+
     @ObservedObject var droplet: MeuwidgetDroplet
     let context: ExpandedSurfaceContext
     @FocusState private var isSearchFocused: Bool
@@ -857,32 +861,13 @@ private struct CommandsSurface: View {
 
     private var searchField: some View {
         HStack(spacing: DroppySpacing.sm) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(AdaptiveColors.notchSurfaceTertiaryText)
-            TextField(
-                "",
-                text: $droplet.query,
-                prompt: Text("Buscar comandos")
-                    .foregroundStyle(AdaptiveColors.notchSurfaceTertiaryText)
-            )
-            .textFieldStyle(.plain)
-            .font(.system(size: 15))
-            .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText)
-            .focused($isSearchFocused)
-            .onSubmit { droplet.confirmSelection() }
-            .onKeyPress(.downArrow) {
-                droplet.moveSelection(by: 1)
-                return .handled
-            }
-            .onKeyPress(.upArrow) {
-                droplet.moveSelection(by: -1)
-                return .handled
-            }
-            // Escape reaches a focused field as the Cancel action.
-            .onExitCommand {
-                droplet.closePalette()
-            }
+            // The caret rides at the end of the text. Following the field's
+            // real insertion point through a `TextSelection` binding crashed
+            // the host on the first keystroke: the index it reports belongs to
+            // the field's own copy of the string, and measuring it against the
+            // text this view draws traps inside `String.Index.utf16Offset(in:)`
+            // when the two are a render apart.
+            EndOfTextSearchField(droplet: droplet, isSearchFocused: $isSearchFocused)
 
             if droplet.status == .scanning, !droplet.rows.isEmpty {
                 Text("Atualizando")
@@ -904,8 +889,13 @@ private struct CommandsSurface: View {
         .padding(.horizontal, DroppySpacing.md)
         .padding(.vertical, DroppySpacing.smd)
         .background(
+            // No fill and no icon, deliberately: the faint placeholder and the
+            // caret pulsing beside it are the only sign that this line takes
+            // typing. `Color.clear` rather than `opacity(0)`, which would stop
+            // the field's padding taking the click that has to reach it before
+            // anything can be typed.
             RoundedRectangle(cornerRadius: DroppyRadius.medium, style: .continuous)
-                .fill(AdaptiveColors.notchSurfaceCardFill)
+                .fill(Color.clear)
         )
     }
 
@@ -931,6 +921,132 @@ private struct CommandsSurface: View {
         case .scanning: return "Lendo os menus de \(appName)…"
         case .ready: return "Nenhum comando encontrado em \(appName)"
         case .failed: return "Não foi possível ler os menus de \(appName)"
+        }
+    }
+}
+
+/// The caret that says where typing lands, drawn rather than styled.
+///
+/// Neither SwiftUI nor AppKit exposes a field's own caret beyond its colour:
+/// SwiftUI has `tint(_:)` and nothing else, and the `NSTextView` under it has
+/// `insertionPointColor`, also only a colour. A glow and a pulse therefore
+/// have to be a view of our own, with the field's caret hidden behind
+/// `tint(.clear)`. It follows the typed text rather than the insertion point,
+/// so it sits after the last character even if the user moves the real caret
+/// with the left and right arrows.
+private struct TypingCaret: View {
+    @State private var isDim = false
+
+    /// Slow enough to read as breathing rather than blinking. Written out
+    /// because no `DroppyAnimation` preset repeats; nothing in the SDK does.
+    private static let pulse = Animation.easeInOut(duration: 1.2).repeatForever(autoreverses: true)
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1, style: .continuous)
+            .fill(AdaptiveColors.notchSurfacePrimaryText)
+            .frame(width: 2, height: 19)
+            // The glow: a tight halo over a wider, fainter one.
+            .shadow(color: AdaptiveColors.notchSurfacePrimaryText.opacity(0.85), radius: 4)
+            .shadow(color: AdaptiveColors.notchSurfacePrimaryText.opacity(0.45), radius: 9)
+            .opacity(isDim ? 0.35 : 1)
+            .onAppear {
+                // Reduce Motion keeps the caret and its glow, and drops the
+                // pulse: it is the one thing on this surface that moves on its
+                // own. DroppyAnimation's own presets read the same setting.
+                guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+                withAnimation(Self.pulse) { isDim = true }
+            }
+    }
+}
+
+/// The modifiers both search fields share: the type, the hidden caret, the
+/// focus, and every key the palette answers.
+private struct SearchFieldChrome: ViewModifier {
+    @ObservedObject var droplet: MeuwidgetDroplet
+    @FocusState.Binding var isSearchFocused: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .textFieldStyle(.plain)
+            .font(.system(size: CommandsSurface.searchFont))
+            .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText)
+            // Hides the field's own caret, which cannot be given a glow or a
+            // pulse; TypingCaret is drawn in its place. It also hides the
+            // selection highlight, which this field never shows off.
+            .tint(.clear)
+            .focused($isSearchFocused)
+            .onSubmit { droplet.confirmSelection() }
+            .onKeyPress(.downArrow) {
+                droplet.moveSelection(by: 1)
+                return .handled
+            }
+            .onKeyPress(.upArrow) {
+                droplet.moveSelection(by: -1)
+                return .handled
+            }
+            // Escape reaches a focused field as the Cancel action.
+            .onExitCommand {
+                droplet.closePalette()
+            }
+    }
+}
+
+/// The caret, and the placeholder beside it, drawn over a search field.
+///
+/// `textBeforeCaret` in the field's own font is exactly as wide as what sits
+/// to the left of the insertion point, so the bar lands on it. The placeholder
+/// follows the caret rather than starting under it, and goes at the first
+/// keystroke. Never takes the click that has to reach the field beneath.
+private struct SearchFieldCaretOverlay: View {
+    let textBeforeCaret: String
+    let isEmpty: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text(verbatim: textBeforeCaret)
+                .font(.system(size: CommandsSurface.searchFont))
+                .opacity(0)
+            TypingCaret()
+            if isEmpty {
+                Text("Buscar comandos")
+                    .font(.system(size: CommandsSurface.searchFont))
+                    .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText.opacity(0.18))
+                    .padding(.leading, DroppySpacing.xsm)
+            }
+            Spacer(minLength: 0)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// The search field: the caret rides at the end of the text, where typing
+/// leaves it.
+///
+/// It followed the field's real insertion point for one build, through the
+/// `TextSelection` binding `TextField(text:selection:)` takes on macOS 15 and
+/// newer. That crashed Droppy Playground 1.0.6 on the first keystroke, every
+/// time: `String.Index.utf16Offset(in:)` trapped inside the body, because the
+/// index the field reports indexes the field's own copy of the string and the
+/// view was drawing the copy from a render earlier. Any measurement of that
+/// index against this view's text has the same hazard, so following the
+/// insertion point needs the caret position in integers, from the field
+/// editor's own `selectedRange`, not `String.Index` arithmetic.
+///
+/// That AppKit route was weighed and left alone. It means owning the field
+/// itself — the focus, the placeholder, and the Return, arrow and Escape
+/// handling this palette has already had to get right — to move a decorative
+/// bar a few characters. The caret is a sign that the line takes typing, not a
+/// readout of the insertion point, and typing lands at the end of the text.
+private struct EndOfTextSearchField: View {
+    @ObservedObject var droplet: MeuwidgetDroplet
+    @FocusState.Binding var isSearchFocused: Bool
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            // No prompt of its own: the placeholder is drawn beside the caret.
+            TextField("", text: $droplet.query)
+                .modifier(SearchFieldChrome(droplet: droplet, isSearchFocused: $isSearchFocused))
+            SearchFieldCaretOverlay(textBeforeCaret: droplet.query, isEmpty: droplet.query.isEmpty)
         }
     }
 }
