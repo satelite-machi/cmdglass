@@ -347,6 +347,34 @@ public final class MeuwidgetDroplet: NSObject, ObservableObject, Droplet {
         notice = nil
     }
 
+    /// The rest of the best match's own title, when what has been typed is the
+    /// start of it: the faint text the field shows after the caret, and what
+    /// Tab fills in.
+    ///
+    /// `nil` when the field is empty, when nothing matched, when the match was
+    /// found in the middle of a title rather than at its start, or when the
+    /// title has already been typed out in full. The prefix test is the one
+    /// the ranking scores highest, on the same folded title, so the suggestion
+    /// can only ever be a continuation of what the list already puts first.
+    var ghostCompletion: (title: String, suffix: String)? {
+        let typed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !typed.isEmpty, let best = rankedRows.first else { return nil }
+        let title = best.path.last ?? best.fullTitle
+        let folded = PaletteRanking.fold(typed)
+        guard best.searchTitle.hasPrefix(folded) else { return nil }
+        // Folding is per character for everything a menu title holds, so the
+        // folded length counts characters of the title too. When some title
+        // ever folds to a different length, it simply gets no ghost.
+        guard best.searchTitle.count == title.count, folded.count < title.count else { return nil }
+        return (title, String(title.dropFirst(folded.count)))
+    }
+
+    /// Fills the field with the suggested command's title, and runs nothing.
+    func completeWithGhost() {
+        guard let ghost = ghostCompletion else { return }
+        query = ghost.title
+    }
+
     func confirmSelection() {
         guard let row = selectedRow(in: rankedRows) else { return }
         confirm(row)
@@ -984,6 +1012,15 @@ private struct SearchFieldChrome: ViewModifier {
                 droplet.moveSelection(by: -1)
                 return .handled
             }
+            // Tab takes the suggestion when there is one, and nothing else:
+            // the command is filled in, not run. With no suggestion showing it
+            // is left alone, so it still moves the focus the way the system
+            // expects it to.
+            .onKeyPress(.tab) {
+                guard droplet.ghostCompletion != nil else { return .ignored }
+                droplet.completeWithGhost()
+                return .handled
+            }
             // Escape reaches a focused field as the Cancel action.
             .onExitCommand {
                 droplet.closePalette()
@@ -1000,6 +1037,10 @@ private struct SearchFieldChrome: ViewModifier {
 private struct SearchFieldCaretOverlay: View {
     let textBeforeCaret: String
     let isEmpty: Bool
+    /// The rest of the suggested command's title, or empty for no suggestion.
+    /// Never both this and the placeholder: one needs typing, the other an
+    /// empty field.
+    let ghost: String
 
     var body: some View {
         HStack(spacing: 0) {
@@ -1012,6 +1053,13 @@ private struct SearchFieldCaretOverlay: View {
                     .font(.system(size: CommandsSurface.searchFont))
                     .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText.opacity(0.18))
                     .padding(.leading, DroppySpacing.xsm)
+            } else if !ghost.isEmpty {
+                // The typed text is drawn by the field itself; this is only
+                // what Tab would add to it, so it starts where the caret is.
+                Text(verbatim: ghost)
+                    .font(.system(size: CommandsSurface.searchFont))
+                    .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText.opacity(0.32))
+                    .lineLimit(1)
             }
             Spacer(minLength: 0)
         }
@@ -1046,7 +1094,11 @@ private struct EndOfTextSearchField: View {
             // No prompt of its own: the placeholder is drawn beside the caret.
             TextField("", text: $droplet.query)
                 .modifier(SearchFieldChrome(droplet: droplet, isSearchFocused: $isSearchFocused))
-            SearchFieldCaretOverlay(textBeforeCaret: droplet.query, isEmpty: droplet.query.isEmpty)
+            SearchFieldCaretOverlay(
+                textBeforeCaret: droplet.query,
+                isEmpty: droplet.query.isEmpty,
+                ghost: droplet.ghostCompletion?.suffix ?? ""
+            )
         }
     }
 }
